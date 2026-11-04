@@ -135,41 +135,56 @@ class TestTpcdsRoundtrip:
                     assert field.dimension.is_time is None, field.name
 
     def test_single_dataset_metrics_survive_with_expressions(self):
+        """Every metric that is not dropped comes back with its expression.
+        One that reaches only one dataset comes back dataset-scoped on it,
+        named unqualified; one that spans datasets comes back model-scoped
+        under Lightdash's `<model>_<metric>` ID with the original name in the
+        extension. Both are compared in qualified form."""
         original, exported, reimported = _roundtrip()
         dropped = {
             issue.element_name
             for issue in exported.issues
             if issue.issue_type is ConverterIssueType.CROSS_DATASET_METRIC_DROPPED
         }
+        fields_by_dataset = {
+            dataset.name: [field.name for field in dataset.fields or []]
+            for dataset in original.datasets
+        }
+
+        def qualified(document):
+            metrics = {
+                _lightdash_name(metric): metric.expression.dialects[0].expression
+                for metric in document.metrics or []
+            }
+            for dataset in document.datasets:
+                for metric in dataset.metrics or []:
+                    metrics[_lightdash_name(metric)] = qualify_bare_columns(
+                        metric.expression.dialects[0].expression,
+                        dataset.name,
+                        fields_by_dataset[dataset.name],
+                    )
+            return metrics
+
         original_metrics = {
-            metric.name: metric.expression.dialects[0].expression
-            for metric in original.metrics or []
-            if metric.name not in dropped
+            name: expression
+            for name, expression in qualified(original).items()
+            if name not in dropped
         }
-        # A dataset-scoped metric names its fields unqualified and comes back
-        # as a model-scoped metric with `dataset.field` references.
-        for dataset in original.datasets:
-            for metric in dataset.metrics or []:
-                original_metrics[metric.name] = qualify_bare_columns(
-                    metric.expression.dialects[0].expression,
-                    dataset.name,
-                    [field.name for field in dataset.fields or []],
-                )
         assert "total_quantity" in original_metrics
-        # Re-imported metrics carry Lightdash's `<model>_<metric>` id as their
-        # Ossie name; the original name is the stashed Lightdash name.
-        roundtripped_metrics = {
-            _lightdash_name(metric): metric.expression.dialects[0].expression
-            for metric in reimported.output.metrics or []
-        }
+        roundtripped_metrics = qualified(reimported.output)
         assert set(roundtripped_metrics) == set(original_metrics)
-        assert "store_sales_total_sales" in {
-            metric.name for metric in reimported.output.metrics
-        }
         for name, expression in original_metrics.items():
             assert roundtripped_metrics[name].replace(" ", "") == expression.replace(
                 " ", ""
             ), name
+        # `total_sales` reaches only store_sales, so it is dataset-scoped
+        # there; `customer_lifetime_value` spans store_sales and customer.
+        store_sales = next(d for d in reimported.output.datasets if d.name == "store_sales")
+        assert "total_sales" in {metric.name for metric in store_sales.metrics}
+        assert "total_quantity" in {metric.name for metric in store_sales.metrics}
+        assert "store_sales_customer_lifetime_value" in {
+            metric.name for metric in reimported.output.metrics
+        }
 
     def test_relationships_are_preserved(self):
         original, _, reimported = _roundtrip()

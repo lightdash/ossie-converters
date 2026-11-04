@@ -35,6 +35,7 @@ from ossie import OssieDialect, OssieDocument
 from ossie_lightdash import LightdashToOssieConverter, OssieToLightdashConverter
 from ossie_lightdash.datatype_utils import datatype_to_lightdash_type
 from ossie_lightdash.dbt_project import model_file_to_dbt_model
+from ossie_lightdash.expression_utils import unqualify_dataset
 
 
 def _expression(sql: str, dialect: str = "OSSIE_SQL_2026"):
@@ -115,13 +116,16 @@ def test_every_metric_survives_with_its_expression(fixture, assert_valid_ossie):
     returned = _round_trip(original)
     assert_valid_ossie(returned)
 
-    # Lightdash scopes metric names per model, so the Ossie name is
-    # `<model>_<metric>` and the bare name travels in the extension.
-    by_name = {_lightdash_name(metric): metric for metric in returned.metrics}
+    # Every fixture metric reaches only `orders`, so it comes back
+    # dataset-scoped on `orders`, under its own name, with the fields named
+    # unqualified.
+    assert returned.metrics is None
+    by_name = {metric.name: metric for metric in returned.datasets[0].metrics}
     assert set(by_name) == {metric.name for metric in original.metrics}
     for metric in original.metrics:
-        assert by_name[metric.name].name == f"orders_{metric.name}"
-        assert by_name[metric.name].expression.dialects[0].expression == metric.expression.dialects[0].expression
+        assert by_name[metric.name].expression.dialects[0].expression == unqualify_dataset(
+            metric.expression.dialects[0].expression, "orders"
+        )
 
     fields = {field.name: field for field in returned.datasets[0].fields}
     for field in original.datasets[0].fields:
@@ -139,7 +143,7 @@ def test_expressions_come_back_portable(fixture):
     returned = _round_trip(FIXTURES[fixture])
     tags = {
         dialect.dialect
-        for element in [*returned.metrics, *returned.datasets[0].fields]
+        for element in [*returned.datasets[0].metrics, *returned.datasets[0].fields]
         for dialect in element.expression.dialects
     }
     assert tags == {OssieDialect.ANSI_SQL}
@@ -150,16 +154,19 @@ def test_the_portable_tag_is_kept_when_the_import_is_told_the_sql_is_portable(fi
     returned = _round_trip(FIXTURES[fixture], import_dialect=OssieDialect.OSSIE_SQL_2026)
     tags = {
         dialect.dialect
-        for element in [*returned.metrics, *returned.datasets[0].fields]
+        for element in [*returned.datasets[0].metrics, *returned.datasets[0].fields]
         for dialect in element.expression.dialects
     }
     assert tags == {OssieDialect.OSSIE_SQL_2026}
 
 
-def test_a_bare_column_reference_is_qualified_on_the_way_back():
-    """The third M0 variant: `SUM(amount)` with no dataset qualifier. Export
-    writes it as `${TABLE}.amount`, so it returns qualified."""
+def test_a_bare_column_reference_comes_back_dataset_scoped():
+    """The third M0 variant: `SUM(amount)` with no dataset qualifier at the
+    model root. Export writes it as `${TABLE}.amount`, and it returns as the
+    dataset-scoped metric it should have been, with the same expression."""
     bare = _model([_field("amount", "amount")], [_metric("total_amount", "SUM(amount)")])
     returned = _round_trip(bare)
-    (metric,) = returned.metrics
-    assert metric.expression.dialects[0].expression == "SUM(orders.amount)"
+    assert returned.metrics is None
+    (metric,) = returned.datasets[0].metrics
+    assert metric.name == "total_amount"
+    assert metric.expression.dialects[0].expression == "SUM(amount)"

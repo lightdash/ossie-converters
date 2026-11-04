@@ -201,10 +201,12 @@ _SOURCE_IDENTIFIER = r'(?:[A-Za-z_][A-Za-z0-9_$]*|"(?:""|[^"])+"|`(?:``|[^`])+`|
 _SOURCE_PATH_RE = re.compile(rf"{_SOURCE_IDENTIFIER}(?:\s*\.\s*{_SOURCE_IDENTIFIER})*")
 
 
-def _metric_names(model: Dict[str, Any], columns: Dict[str, Dict[str, Any]]) -> Set[str]:
-    """Gets the Lightdash metric names already defined on a model: its own
-    metrics and the metrics of its columns, which share one namespace."""
+def _taken_field_names(model: Dict[str, Any], columns: Dict[str, Dict[str, Any]]) -> Set[str]:
+    """Gets the field names a metric can't take on a model: its dimensions,
+    its own metrics, and the metrics of its columns. Lightdash keys all of
+    them as ``<model>_<name>``, and skips a metric named like a dimension."""
     names = set((model.get("meta") or {}).get("metrics") or {})
+    names.update(columns)
     for column in columns.values():
         names.update((column.get("meta") or {}).get("metrics") or {})
     return names
@@ -603,6 +605,13 @@ class OssieToLightdashConverter:
 
         if scope_dataset is not None:
             target_dataset: Optional[str] = scope_dataset
+            if referenced_datasets(expression, set(dataset_names) - {scope_dataset}):
+                issues.append(
+                    ConverterIssue(
+                        issue_type=ConverterIssueType.METRIC_SCOPE_INVALID,
+                        element_name=f"{scope_dataset}.{metric.name}",
+                    )
+                )
             try:
                 expression = qualify_bare_columns(
                     expression,
@@ -669,24 +678,27 @@ class OssieToLightdashConverter:
         )
 
         # The Lightdash name is the one from the extension, else the Ossie
-        # name with the `<model>_` field-ID prefix removed, else the Ossie
-        # name as is.
+        # name. A model-scoped name is Lightdash's `<model>_<metric>` field
+        # ID, so that prefix is removed. A dataset-scoped name is already
+        # scoped to its dataset and is used as it is.
         lightdash_name = extension_data.get("name")
         if not isinstance(lightdash_name, str) or not lightdash_name:
             prefix = f"{target_dataset}_"
             lightdash_name = (
                 metric.name[len(prefix):]
-                if metric.name.startswith(prefix) and len(metric.name) > len(prefix)
+                if scope_dataset is None
+                and metric.name.startswith(prefix)
+                and len(metric.name) > len(prefix)
                 else metric.name
             )
 
-        # Lightdash scopes metric names per model, across the model's own
-        # metrics and its columns' metrics. Two Ossie metrics can map to one
-        # name (`revenue` and `orders_revenue` on `orders` both strip to
-        # `revenue`), and the later one must not overwrite the earlier one.
-        # It keeps its full Ossie name when that is free, else a suffix.
+        # Lightdash keys a model's dimensions, its own metrics and its
+        # columns' metrics in one namespace, and skips a metric named like a
+        # dimension. Two Ossie metrics can also map to one name (`revenue`
+        # and `orders_revenue` on `orders` both strip to `revenue`). The later
+        # one keeps its full Ossie name when that is free, else a suffix.
         model = models_by_dataset[target_dataset]
-        taken = _metric_names(model, columns_by_dataset[target_dataset])
+        taken = _taken_field_names(model, columns_by_dataset[target_dataset])
         if lightdash_name in taken:
             candidate = metric.name
             suffix = 2

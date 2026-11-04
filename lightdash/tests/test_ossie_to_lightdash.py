@@ -1209,7 +1209,9 @@ class TestDatasetScopedMetrics:
                 "type": "number",
                 "sql": "SUM(${TABLE}.amount) / NULLIF(COUNT(DISTINCT ${TABLE}.customer_id), 0)",
             },
-            "completed_amount": {
+            # A dataset-scoped name is used as it is: no `<model>_` prefix
+            # is stripped, because the name is already scoped to the dataset.
+            "orders_completed_amount": {
                 "type": "sum",
                 "sql": "CASE WHEN ${TABLE}.status = 'completed' THEN ${TABLE}.amount ELSE 0 END",
             },
@@ -1227,17 +1229,135 @@ class TestDatasetScopedMetrics:
         assert "metrics" not in _model(result.output, "customers").get("meta", {})
         assert result.issues == []
 
-    def test_dataset_scoped_metric_round_trips_as_a_model_scoped_metric(self):
+    def test_dataset_scoped_metric_round_trips_exactly(self):
         document = self._document(
-            OssieMetric(name="total_amount", expression=_ansi("SUM(amount)"))
+            OssieMetric(name="total_amount", expression=_ansi("SUM(amount)")),
+            OssieMetric(name="orders_total", expression=_ansi("SUM(amount) * 2")),
         )
         exported = OssieToLightdashConverter().convert(document)
         reimported = LightdashToOssieConverter().convert(
             exported.output, database="analytics_db", schema="marts", semantic_model_name="sales"
         )
         assert reimported.issues == []
-        metrics = {
-            metric.name: metric.expression.dialects[0].expression
-            for metric in reimported.output.metrics
+        assert reimported.output.metrics is None
+        orders = next(d for d in reimported.output.datasets if d.name == "orders")
+        # The name is kept as it is, no `<model>_` prefix stripped or added.
+        assert {m.name: m.expression.dialects[0].expression for m in orders.metrics} == {
+            "total_amount": "SUM(amount)",
+            "orders_total": "SUM(amount) * 2",
         }
-        assert metrics == {"orders_total_amount": "SUM(orders.amount)"}
+
+    @pytest.mark.parametrize(
+        "expression,expected",
+        [
+            ("PERCENTILE_CONT(0.9) WITHIN GROUP (ORDER BY amount)", {"type": "percentile", "percentile": 90}),
+            ("COUNT(DISTINCT amount)", {"type": "count_distinct"}),
+            ("SUM(DISTINCT amount)", {"type": "sum_distinct"}),
+        ],
+    )
+    def test_typed_aggregations_over_an_unqualified_field(self, expression, expected):
+        document = self._document(OssieMetric(name="m", expression=_ansi(expression)))
+        result = OssieToLightdashConverter().convert(document)
+        assert _column(_model(result.output, "orders"), "amount")["meta"]["metrics"] == {"m": expected}
+        assert result.issues == []
+
+    def test_fields_inside_functions_are_qualified_in_the_warehouse_dialect(self):
+        document = self._document(
+            OssieMetric(
+                name="first_month",
+                expression=OssieExpression(
+                    dialects=[
+                        OssieDialectExpression(
+                            dialect=OssieDialect.SNOWFLAKE,
+                            expression="MIN(DATE_TRUNC('month', order_date))",
+                        )
+                    ]
+                ),
+            )
+        )
+        result = OssieToLightdashConverter(OssieDialect.SNOWFLAKE).convert(document)
+        assert _model(result.output, "orders")["meta"]["metrics"] == {
+            "first_month": {"type": "min", "sql": "DATE_TRUNC('month', ${TABLE}.order_date)"}
+        }
+        assert result.issues == []
+
+    def test_unparseable_sql_is_exported_as_written(self):
+        document = self._document(
+            OssieMetric(name="odd", expression=_ansi("SUM(amount) FILTER (WHERE amount > 0) ::: x"))
+        )
+        result = OssieToLightdashConverter().convert(document)
+        assert _model(result.output, "orders")["meta"]["metrics"] == {
+            "odd": {"type": "number", "sql": "SUM(amount) FILTER (WHERE amount > 0) ::: x"}
+        }
+        assert result.issues == []
+
+    def test_extension_name_wins_and_extension_model_is_ignored(self):
+        document = self._document(
+            OssieMetric(
+                name="total",
+                expression=_ansi("SUM(amount)"),
+                custom_extensions=[
+                    OssieCustomExtension(
+                        vendor_name="LIGHTDASH",
+                        data=json.dumps({"name": "grand_total", "model": "customers"}),
+                    )
+                ],
+            )
+        )
+        result = OssieToLightdashConverter().convert(document)
+        assert _column(_model(result.output, "orders"), "amount")["meta"]["metrics"] == {
+            "grand_total": {"type": "sum"}
+        }
+        assert "metrics" not in _model(result.output, "customers").get("meta", {})
+        assert result.issues == []
+
+    def test_reference_to_another_dataset_is_reported_and_exported_through_the_join(self):
+        """Spec rule 1: a dataset-scoped metric must not reach another
+        dataset. Lightdash can still evaluate it through the join."""
+        document = self._document(
+            OssieMetric(name="tier_count", expression=_ansi("COUNT(DISTINCT customers.customer_id)"))
+        )
+        result = OssieToLightdashConverter().convert(document)
+        assert _model(result.output, "orders")["meta"]["metrics"] == {
+            "tier_count": {"type": "count_distinct", "sql": "${customers.customer_id}"}
+        }
+        assert [(i.issue_type, i.element_name) for i in result.issues] == [
+            (ConverterIssueType.METRIC_SCOPE_INVALID, "orders.tier_count")
+        ]
+
+    def test_metric_named_like_a_dimension_is_renamed(self):
+        """Spec rule 2, and Lightdash skips a metric named like a dimension
+        ("Dimensions take priority"), so the metric would be lost."""
+        document = self._document(OssieMetric(name="amount", expression=_ansi("SUM(amount)")))
+        result = OssieToLightdashConverter().convert(document)
+        assert _column(_model(result.output, "orders"), "amount")["meta"]["metrics"] == {
+            "amount_2": {"type": "sum"}
+        }
+        (issue,) = result.issues
+        assert issue.issue_type is ConverterIssueType.METRIC_NAME_COLLISION
+        assert issue.element_name.startswith("amount ")
+
+    def test_model_scoped_metric_named_like_a_dimension_is_renamed_too(self):
+        document = _document().model_copy(
+            update={"metrics": [OssieMetric(name="orders_amount", expression=_ansi("SUM(orders.amount)"))]}
+        )
+        result = OssieToLightdashConverter().convert(document)
+        assert _column(_model(result.output, "orders"), "amount")["meta"]["metrics"] == {
+            "orders_amount": {"type": "sum"}
+        }
+        assert [i.issue_type for i in result.issues] == [ConverterIssueType.METRIC_NAME_COLLISION]
+
+    def test_dataset_and_model_scoped_metrics_share_the_model_namespace(self):
+        document = self._document(
+            OssieMetric(name="total", expression=_ansi("SUM(amount)"))
+        ).model_copy(
+            update={"metrics": [OssieMetric(name="orders_total", expression=_ansi("MAX(orders.amount)"))]}
+        )
+        result = OssieToLightdashConverter().convert(document)
+        # Model-scoped metrics are placed first, so `orders_total` takes
+        # `total`; the dataset-scoped `total` is renamed.
+        assert _column(_model(result.output, "orders"), "amount")["meta"]["metrics"] == {
+            "total": {"type": "max"},
+            "total_2": {"type": "sum"},
+        }
+        assert [i.issue_type for i in result.issues] == [ConverterIssueType.METRIC_NAME_COLLISION]

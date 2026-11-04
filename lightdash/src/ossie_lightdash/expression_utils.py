@@ -250,6 +250,15 @@ def ossie_sql_to_lightdash(
     return _sub_outside_literals(_reference_pattern(names), replace, expression)
 
 
+def unqualify_dataset(expression: str, dataset: str) -> str:
+    """Rewrites ``dataset.column`` references to the bare ``column``, the form
+    a dataset-scoped metric uses. Text inside string literals and longer
+    paths (``warehouse.orders.id``) are left as they are."""
+    return _sub_outside_literals(
+        _reference_pattern({dataset}), lambda match: match.group(2), expression
+    )
+
+
 def has_non_portable_reference(sql: str) -> bool:
     """Checks whether the SQL depends on Lightdash query-time evaluation:
     project parameters, user attributes, or Liquid templating."""

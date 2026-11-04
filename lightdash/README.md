@@ -150,7 +150,7 @@ format stores in the extension (`sql_filter`, `group_details`,
 | `metric` that is one aggregation over a column (`SUM(ds.col)`, `COUNT(DISTINCT ds.col)`, `SUM(DISTINCT ds.col)`, `PERCENTILE_CONT(0.9) WITHIN GROUP (ORDER BY ds.col)`) | Column-level `meta.metrics.<name>` with a typed metric (`sum`, `count_distinct`, `sum_distinct`, `percentile` with `percentile: 90`). |
 | `metric` that is one aggregation over any other expression (`AVG(CASE WHEN ds.status = 'done' THEN 1 ELSE 0 END)`) | Model-level `meta.metrics.<name>` with the typed metric and the operand as `sql`. |
 | `metric` with any other expression | Model-level `meta.metrics.<name>` with `type: number` and `sql`, on the dataset that joins every other dataset the expression references (`${joined_model.col}`). |
-| Dataset-scoped `datasets[].metrics` (`SUM(ss_quantity)`, fields named unqualified) | The same column-level or model-level metric, always on that dataset's model, with the fields qualified as `${TABLE}.col`. On import, every metric is model-scoped with `dataset.field` references. |
+| Dataset-scoped `datasets[].metrics` (`SUM(ss_quantity)`, fields named unqualified) | The same column-level or model-level metric, always on that dataset's model, with the fields qualified as `${TABLE}.col`. On import, a metric that reaches only its own model (a column metric, or model SQL over `${TABLE}` columns) comes back dataset-scoped under its Lightdash name; a metric that reaches a joined model comes back model-scoped. |
 | `relationship` | `meta.joins`. `sql_on` is built from, and parsed into, column pairs. `relationship` is `many-to-one` unless the extension holds another value. The `alias` and the other join attributes (`relationship`, `type`, `fields`) are stored in the relationship's `LIGHTDASH` extension. A dataset joined more than once from the same model gets an alias on export. |
 | A join that Ossie can't reproduce: chained through another joined model (`${projects.org_id} = ${organizations.org_id}` on the `queries` explore), an expression join (`LOWER(a) = b`), or extra conditions | The column pairs still become relationships. A chained pair produces the edge between the two models it names, unless that model declares the edge itself. The join is stored verbatim in the dataset's `LIGHTDASH` extension and restored on export, replacing the generated join to the same target and alias. Pair order and side order (`${T.y} = ${M.x}`) carry no meaning and are not stored. |
 | Model meta without Ossie vocabulary (`label`, `hidden`, `sql_filter`, `group_details`, `default_time_dimension`, `required_filters`, `order_fields_by`) and column meta outside `dimension` and `metrics` (`additional_dimensions`) | Stored in the dataset's or field's `LIGHTDASH` extension (column meta under `column_meta`) and restored on export. Other consumers don't read them. |
@@ -220,16 +220,34 @@ the same way: it converts what has vocabulary on both sides, keeps the rest in
 the `LIGHTDASH` extension, and reports whatever another consumer of the
 document won't see.
 
-**Scope of metric names.** Lightdash scopes metric names per model and Ossie
-per semantic model, and most Lightdash projects have a `count` on several
-models. The Ossie name is therefore always Lightdash's field ID,
-`<model>_<metric>`, not only on collision: a metric's name must not change
-because a metric was added to a different model, and the field ID is what
-Lightdash users see in its API and URLs. The bare name is stored in the
-extension and restored, so a Lightdash to Ossie to Lightdash round trip is
-exact. An Ossie document that Lightdash didn't write has its metric names
+**Scope of metrics and their names.** Lightdash scopes every metric to a
+model, and a model metric reaches other models only through the model's
+joins. Ossie has the same two levels: a dataset-scoped metric
+(`datasets[].metrics`) aggregates its own dataset's fields, named
+unqualified, and a model-scoped metric (model-root `metrics`) spans datasets
+with `dataset.field` references. On import, a metric whose SQL reaches only
+its own model (every column metric, and model SQL over `${TABLE}` columns)
+becomes dataset-scoped under its Lightdash name, which is already scoped to
+the model. A metric whose SQL reaches a joined model becomes model-scoped,
+and because most Lightdash projects have a `count` on several models, its
+Ossie name is Lightdash's field ID, `<model>_<metric>`, not only on
+collision: a metric's name must not change because a metric was added to a
+different model, and the field ID is what Lightdash users see in its API and
+URLs. The bare name and the model are stored in the extension and restored,
+so a Lightdash to Ossie to Lightdash round trip is exact in both scopes. An
+Ossie document that Lightdash didn't write has its model-scoped metric names
 normalized once: `total_sales` on `store_sales` becomes
-`store_sales_total_sales`.
+`store_sales_total_sales` when it comes back through Lightdash; a
+dataset-scoped `total_quantity` on `store_sales` keeps its name.
+
+Lightdash itself keeps a model's dimension and metric names apart (a metric
+named like a dimension is skipped at compile time), and the core spec keeps a
+dataset's field and dataset-scoped metric names apart. On export, a metric
+whose Lightdash name is already a dimension or metric on the model is renamed
+with a `METRIC_NAME_COLLISION` issue rather than silently lost. A
+dataset-scoped metric that references another dataset, which the spec
+forbids, is exported through the model's joins as written and reported as
+`METRIC_SCOPE_INVALID`.
 
 **What a dimension is.** Every dbt column is a Lightdash dimension unless it
 is hidden. An Ossie field is a dimension only when it declares one.
@@ -292,12 +310,13 @@ dataset is unrestricted).
   `${date_dim.year}`, not the aliased second join). A `${alias.column}`
   reference is rewritten to the joined dataset with an
   `ALIAS_REFERENCE_FLATTENED` issue.
-- A name that still collides after qualification (model `orders` with metric
-  `x_total` versus model `orders_x` with metric `total`) gets a suffix and a
-  `METRIC_NAME_COLLISION` issue. On export, two Ossie metrics that map to one
-  Lightdash name on the same model (`revenue` and `orders_revenue` both strip
-  to `revenue`) raise the same issue, and the later one keeps its full Ossie
-  name instead of overwriting the earlier one.
+- A model-scoped name that still collides after qualification (model
+  `orders` with metric `x_total` versus model `orders_x` with metric `total`,
+  both reaching a join) gets a suffix and a `METRIC_NAME_COLLISION` issue. On
+  export, a metric whose Lightdash name is already taken on the model (a
+  dimension, or `revenue` and `orders_revenue` both stripping to `revenue`)
+  raises the same issue, and the later one keeps its full Ossie name, or a
+  suffix, instead of overwriting the earlier one.
 - On export, the synonyms and examples of a structured `ai_context` become
   extra `ai_hint` lines. On import, `ai_hint` becomes a plain instruction
   string.
@@ -338,7 +357,7 @@ On export: `CROSS_DATASET_METRIC_DROPPED`, `FIELD_REFERENCE_UNJOINED`,
 `TIME_ROLE_NOT_REPRESENTABLE`, `DIMENSION_TYPE_DEFAULTED`,
 `COLUMN_META_NOT_REPRESENTABLE`, `CATALOG_MODEL_MISSING`, `DIALECT_UNAVAILABLE`,
 `RELATIONSHIP_COLUMNS_MISMATCHED`, `EXTENSION_DATA_INVALID`,
-`FOREIGN_EXTENSION_IGNORED`, `METRIC_NAME_COLLISION`.
+`FOREIGN_EXTENSION_IGNORED`, `METRIC_NAME_COLLISION`, `METRIC_SCOPE_INVALID`.
 
 ## Development
 

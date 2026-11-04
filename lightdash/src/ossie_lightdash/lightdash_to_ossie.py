@@ -62,6 +62,8 @@ from ossie_lightdash.expression_utils import (
     has_non_portable_reference,
     lightdash_sql_to_ossie,
     qualify_bare_columns,
+    referenced_datasets,
+    unqualify_dataset,
 )
 
 LIGHTDASH_VENDOR_NAME = "LIGHTDASH"
@@ -234,6 +236,9 @@ class _ModelContext:
         self.dialect = dialect
         self.column_types: Dict[str, str] = {}
         self.column_names: List[str] = []
+        # Names taken in the dataset's namespace: its fields, then the
+        # dataset-scoped metrics as they are added.
+        self.scoped_names: Set[str] = set()
         # Datatypes from --catalog, used when a column has no authored type.
         self.catalog_datatypes: Dict[str, "OssieDataType"] = {}
         self._expressions: Dict[str, Optional[str]] = {}
@@ -362,16 +367,25 @@ class LightdashToOssieConverter:
         # Lightdash treats seeds as tables, the same as models.
         schema_yml = _mapping(schema_yml, "the schema document")
         nodes = [
-            *_sequence(schema_yml.get("models"), "models"),
-            *_sequence(schema_yml.get("seeds"), "seeds"),
+            _named(model, f"model #{index + 1}")
+            for index, model in enumerate(
+                [
+                    *_sequence(schema_yml.get("models"), "models"),
+                    *_sequence(schema_yml.get("seeds"), "seeds"),
+                ]
+            )
         ]
-        for index, model in enumerate(nodes):
+        # Every model is a dataset. A metric whose expression reaches none of
+        # the others is dataset-scoped.
+        all_dataset_names = {model["name"] for model in nodes}
+        for model in nodes:
             dataset, model_metrics, model_direct, model_derived = self._convert_model(
-                _named(model, f"model #{index + 1}"),
+                model,
                 database=database,
                 schema=schema,
                 issues=issues,
                 metric_names=metric_names,
+                dataset_names=all_dataset_names,
                 catalog=catalog,
             )
             datasets.append(dataset)
@@ -432,8 +446,11 @@ class LightdashToOssieConverter:
         schema: Optional[str],
         issues: List[ConverterIssue],
         metric_names: Set[str],
+        dataset_names: Set[str],
         catalog: Optional[Catalog] = None,
     ) -> Tuple[OssieDataset, List[OssieMetric], List[_Edge], List[_Edge]]:
+        """Converts one model into a dataset, with its dataset-scoped metrics
+        on it, and returns the model-scoped metrics and join edges alongside."""
         name = model["name"]
         model_meta = lightdash_meta(model)
         # A model that names its own relation (a Lightdash model file, or
@@ -488,6 +505,7 @@ class LightdashToOssieConverter:
 
         context = _ModelContext(name, aliases, definitions, issues, self._dialect)
         context.column_names = [column["name"] for column in model.get("columns") or []]
+        context.scoped_names = set(context.column_names)
         if catalog is not None:
             if name in catalog:
                 for column_name, warehouse_type in catalog[name].items():
@@ -523,12 +541,15 @@ class LightdashToOssieConverter:
                 fields.append(field)
 
         metrics: List[OssieMetric] = []
+        dataset_metrics: List[OssieMetric] = []
         for metric_name, (definition, column_name) in definitions.items():
-            metric = self._convert_metric(
-                metric_name, definition, column_name, context, metric_names
+            converted = self._convert_metric(
+                metric_name, definition, column_name, context, metric_names, dataset_names
             )
-            if metric is not None:
-                metrics.append(metric)
+            if converted is None:
+                continue
+            metric, dataset_scoped = converted
+            (dataset_metrics if dataset_scoped else metrics).append(metric)
 
         direct_edges, derived_edges, stashed_joins = self._convert_joins(
             joins, from_model=name, aliases=aliases, issues=issues
@@ -557,6 +578,7 @@ class LightdashToOssieConverter:
             primary_key=_primary_key(model_meta.get("primary_key")),
             ai_context=_ai_context(model_meta.get("ai_hint")),
             fields=fields or None,
+            metrics=dataset_metrics or None,
             custom_extensions=_lightdash_extension(stash) or None,
         )
         return dataset, metrics, direct_edges, derived_edges
@@ -638,7 +660,21 @@ class LightdashToOssieConverter:
         column: Optional[str],
         context: _ModelContext,
         metric_names: Set[str],
-    ) -> Optional[OssieMetric]:
+        dataset_names: Set[str],
+    ) -> Optional[Tuple[OssieMetric, bool]]:
+        """Converts one Lightdash metric.
+
+        A metric whose expression reaches only its own model (a column
+        metric, or model SQL over ``${TABLE}`` columns) is dataset-scoped: it
+        goes on the dataset under its Lightdash name, with the fields named
+        unqualified. A metric that reaches a joined model is model-scoped and
+        goes on the document under Lightdash's ``<model>_<metric>`` field ID,
+        with the fields named ``dataset.field``.
+
+        Returns:
+            The metric and whether it is dataset-scoped, or None when the
+            metric has no expression or is not portable.
+        """
         if column is None and not definition.get("sql"):
             context.issues.append(
                 ConverterIssue(
@@ -670,22 +706,40 @@ class LightdashToOssieConverter:
         extension_data = {
             key: value for key, value in definition.items() if key not in excluded
         }
-        # Lightdash scopes metric names per model, and Ossie per semantic
-        # model. The Ossie name is Lightdash's field ID, `<model>_<metric>`.
-        # The bare name is stored in the extension, so the export restores it
-        # exactly.
-        extension_data["name"] = metric_name
-        extension_data["model"] = context.dataset_name
-        qualified = f"{context.dataset_name}_{metric_name}"
-        ossie_name = _unique_name(qualified, metric_names)
-        if ossie_name != qualified:
-            context.issues.append(
-                ConverterIssue(
-                    issue_type=ConverterIssueType.METRIC_NAME_COLLISION,
-                    element_name=metric_name,
+        dataset_scoped = not (
+            referenced_datasets(expression, dataset_names) - {context.dataset_name}
+        )
+        if dataset_scoped:
+            # The dataset's fields and metrics share one namespace, and the
+            # Lightdash name is scoped to the model already. Lightdash keeps
+            # the two apart itself, so a collision is a defect in the input.
+            expression = unqualify_dataset(expression, context.dataset_name)
+            ossie_name = _unique_name(metric_name, context.scoped_names)
+            if ossie_name != metric_name:
+                extension_data["name"] = metric_name
+                context.issues.append(
+                    ConverterIssue(
+                        issue_type=ConverterIssueType.METRIC_NAME_COLLISION,
+                        element_name=f"{context.dataset_name}.{metric_name}",
+                    )
                 )
-            )
-        return OssieMetric(
+        else:
+            # Lightdash scopes metric names per model, and Ossie model-scoped
+            # metrics per semantic model. The Ossie name is Lightdash's field
+            # ID, `<model>_<metric>`. The bare name and the model are stored
+            # in the extension, so the export restores both exactly.
+            extension_data["name"] = metric_name
+            extension_data["model"] = context.dataset_name
+            qualified = f"{context.dataset_name}_{metric_name}"
+            ossie_name = _unique_name(qualified, metric_names)
+            if ossie_name != qualified:
+                context.issues.append(
+                    ConverterIssue(
+                        issue_type=ConverterIssueType.METRIC_NAME_COLLISION,
+                        element_name=metric_name,
+                    )
+                )
+        metric = OssieMetric(
             name=ossie_name,
             expression=_expression(expression, self._dialect),
             datatype=metric_datatype(
@@ -696,6 +750,7 @@ class LightdashToOssieConverter:
             ai_context=_ai_context(definition.get("ai_hint")),
             custom_extensions=_lightdash_extension(extension_data) or None,
         )
+        return metric, dataset_scoped
 
     @staticmethod
     def _convert_joins(

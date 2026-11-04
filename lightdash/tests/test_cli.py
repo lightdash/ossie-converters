@@ -115,7 +115,9 @@ def test_import_reads_a_whole_dbt_project(tmp_path, capsys):
     assert [d.name for d in document.datasets] == ["customers", "orders", "statuses"]
     err = capsys.readouterr().err
     assert "Skipped" in err and "template.yml" in err
-    assert document.metrics[0].name == "orders_total"
+    orders = next(d for d in document.datasets if d.name == "orders")
+    assert [m.name for m in orders.metrics] == ["total"]
+    assert document.metrics is None
 
 def test_import_takes_types_from_a_dbt_catalog(tmp_path):
     schema_yml = tmp_path / "schema.yml"
@@ -175,10 +177,13 @@ def test_lightdash_model_files_import_and_round_trip(tmp_path):
     assert {(r.from_dataset, r.to) for r in roundtripped.relationships} == {
         (r.from_dataset, r.to) for r in original.relationships
     }
-    # A dataset-scoped metric comes back model-scoped, so count both.
-    assert len(roundtripped.metrics) == len(original.metrics) + sum(
-        len(dataset.metrics or []) for dataset in original.datasets
-    )
+    # Every metric comes back, single-dataset ones as dataset-scoped.
+    def _count(document):
+        return len(document.metrics or []) + sum(
+            len(dataset.metrics or []) for dataset in document.datasets
+        )
+
+    assert _count(roundtripped) == _count(original)
 
 
 @pytest.mark.parametrize("output_format", ["lightdash-yml", "dbt-meta"])

@@ -159,12 +159,20 @@ def _raw_lightdash_data(element):
 
 
 def _metric(document, name):
-    """Look a metric up by its Lightdash name (stashed in the extension)."""
+    """Look a metric up by its Lightdash name: a dataset-scoped metric's own
+    name, or a model-scoped metric's name stashed in the extension."""
     return next(
         m
-        for m in document.metrics
-        if _raw_lightdash_data(m).get("name") == name
+        for m in [
+            *(m for d in document.datasets for m in d.metrics or []),
+            *(document.metrics or []),
+        ]
+        if _raw_lightdash_data(m).get("name", m.name) == name
     )
+
+
+def _dataset(document, name):
+    return next(d for d in document.datasets if d.name == name)
 
 
 def _lightdash_data(element):
@@ -227,7 +235,7 @@ class TestLightdashToOssie:
     def test_typed_metric_becomes_aggregation_expression(self):
         result = LightdashToOssieConverter().convert(SCHEMA_YML, schema="marts")
         metric = _metric(result.output, "total_amount")
-        assert metric.expression.dialects[0].expression == "SUM(orders.amount)"
+        assert metric.expression.dialects[0].expression == "SUM(amount)"
         assert _lightdash_data(metric) == {"label": "Total amount", "format": "usd"}
         assert metric.ai_context == "Revenue before refunds."
 
@@ -236,7 +244,7 @@ class TestLightdashToOssie:
         metric = _metric(result.output, "unique_customers")
         assert (
             metric.expression.dialects[0].expression
-            == "COUNT(DISTINCT orders.customer_id)"
+            == "COUNT(DISTINCT customer_id)"
         )
 
     def test_percentile_metric_becomes_percentile_cont(self):
@@ -244,7 +252,7 @@ class TestLightdashToOssie:
         metric = _metric(result.output, "p90_amount")
         assert (
             metric.expression.dialects[0].expression
-            == "PERCENTILE_CONT(0.9) WITHIN GROUP (ORDER BY orders.amount)"
+            == "PERCENTILE_CONT(0.9) WITHIN GROUP (ORDER BY amount)"
         )
         assert _lightdash_data(metric) == {}
 
@@ -253,7 +261,7 @@ class TestLightdashToOssie:
         metric = _metric(result.output, "conversion_rate")
         assert (
             metric.expression.dialects[0].expression
-            == "SUM(orders.completed_count) / NULLIF(SUM(orders.total_count), 0)"
+            == "SUM(completed_count) / NULLIF(SUM(total_count), 0)"
         )
         assert _lightdash_data(metric) == {
             "label": "Conversion rate",
@@ -291,7 +299,7 @@ class TestLightdashToOssie:
         metric = _metric(result.output, "p90_custom")
         assert (
             metric.expression.dialects[0].expression
-            == "PERCENTILE_CONT(0.9) WITHIN GROUP (ORDER BY orders.amount - orders.discount)"
+            == "PERCENTILE_CONT(0.9) WITHIN GROUP (ORDER BY amount - discount)"
         )
         assert _lightdash_data(metric) == {}
 
@@ -316,7 +324,7 @@ class TestLightdashToOssie:
         metric = _metric(result.output, "orders_per_customer")
         assert (
             metric.expression.dialects[0].expression
-            == "COUNT(orders.order_id) / COUNT(DISTINCT customers.customer_id)"
+            == "COUNT(order_id) / COUNT(DISTINCT customers.customer_id)"
         )
 
     def test_model_metric_without_sql_is_skipped(self):
@@ -381,12 +389,12 @@ class TestLightdashToOssie:
         result = LightdashToOssieConverter().convert(schema_yml, schema="marts")
         assert (
             _metric(result.output, "completion_rate").expression.dialects[0].expression
-            == "AVG(CASE WHEN work_orders.status = 'Completed' THEN 1 ELSE 0 END)"
+            == "AVG(CASE WHEN status = 'Completed' THEN 1 ELSE 0 END)"
         )
         distinct_total = _metric(result.output, "distinct_total")
         assert (
             distinct_total.expression.dialects[0].expression
-            == "SUM(DISTINCT work_orders.status)"
+            == "SUM(DISTINCT status)"
         )
         assert _lightdash_data(distinct_total) == {}
 
@@ -416,7 +424,7 @@ class TestLightdashToOssie:
         result = LightdashToOssieConverter().convert(schema_yml, schema="marts")
         assert (
             _metric(result.output, "amount_per_customer").expression.dialects[0].expression
-            == "(SUM(orders.amount)) / NULLIF((COUNT(DISTINCT orders.customer_id)), 0)"
+            == "(SUM(amount)) / NULLIF((COUNT(DISTINCT customer_id)), 0)"
         )
         assert [
             issue.element_name
@@ -623,33 +631,106 @@ class TestLightdashToOssie:
         assert orders.fields[0].label == "Order amount"
         assert orders.fields[0].datatype is OssieDataType.DECIMAL
         assert _metric(result.output, "total_amount").expression.dialects[0].expression == (
-            "SUM(orders.amount)"
+            "SUM(amount)"
         )
         assert result.output.relationships[0].to == "customers"
 
-    def test_metric_names_are_qualified_with_the_model(self):
+    def test_single_model_metrics_are_dataset_scoped_under_their_own_name(self):
+        """A column metric reaches only its model, so it is dataset-scoped:
+        its name is the Lightdash name, no field-ID prefix, nothing in the
+        extension, and the fields are named unqualified."""
         result = LightdashToOssieConverter().convert(SCHEMA_YML, schema="marts")
-        metric = _metric(result.output, "total_amount")
-        assert metric.name == "orders_total_amount"
-        assert _raw_lightdash_data(metric)["name"] == "total_amount"
-        assert _raw_lightdash_data(metric)["model"] == "orders"
-        assert [m.name for m in result.output.metrics][:3] == [
-            "orders_total_amount",
-            "orders_latest_amount",
-            "orders_median_amount",
+        orders = _dataset(result.output, "orders")
+        assert [m.name for m in orders.metrics][:3] == [
+            "total_amount",
+            "latest_amount",
+            "median_amount",
         ]
+        metric = _metric(result.output, "total_amount")
+        assert metric.expression.dialects[0].expression == "SUM(amount)"
+        assert "name" not in _raw_lightdash_data(metric)
+        assert "model" not in _raw_lightdash_data(metric)
 
-    def test_qualified_names_that_still_collide_are_suffixed(self):
+    def test_metrics_that_reach_a_join_are_model_scoped_and_qualified(self):
         schema_yml = {
             "models": [
                 {
                     "name": "orders",
-                    "columns": [{"name": "amount", "meta": {"metrics": {"x_total": {"type": "sum"}}}}],
+                    "meta": {
+                        "joins": [
+                            {"join": "customers", "sql_on": "${orders.customer_id} = ${customers.id}"}
+                        ],
+                        "metrics": {
+                            "customer_count": {"type": "count_distinct", "sql": "${customers.id}"},
+                            "order_count": {"type": "count", "sql": "${TABLE}.order_id"},
+                            "orders_per_customer": {
+                                "type": "number",
+                                "sql": "${order_count} / ${customer_count}",
+                            },
+                        },
+                    },
+                    "columns": [{"name": "order_id"}, {"name": "customer_id"}],
+                },
+                {"name": "customers", "columns": [{"name": "id"}]},
+            ]
+        }
+        result = LightdashToOssieConverter().convert(schema_yml, schema="marts")
+        orders = _dataset(result.output, "orders")
+        assert {m.name: m.expression.dialects[0].expression for m in orders.metrics} == {
+            "order_count": "COUNT(order_id)"
+        }
+        # `orders_per_customer` reaches `customers` through the inlined
+        # `${customer_count}`, so it is model-scoped too.
+        assert {m.name: m.expression.dialects[0].expression for m in result.output.metrics} == {
+            "orders_customer_count": "COUNT(DISTINCT customers.id)",
+            "orders_orders_per_customer": "(COUNT(orders.order_id)) / (COUNT(DISTINCT customers.id))",
+        }
+        metric = _metric(result.output, "customer_count")
+        assert _raw_lightdash_data(metric) == {"name": "customer_count", "model": "orders"}
+
+    def test_metric_named_like_a_field_is_suffixed(self):
+        """Fields and dataset-scoped metrics share one namespace in Ossie.
+        Lightdash skips such a metric at compile time, so this is a defect in
+        the input, kept rather than dropped."""
+        schema_yml = {
+            "models": [
+                {
+                    "name": "orders",
+                    "columns": [{"name": "amount", "meta": {"metrics": {"amount": {"type": "sum"}}}}],
+                }
+            ]
+        }
+        result = LightdashToOssieConverter().convert(schema_yml, schema="marts")
+        (metric,) = _dataset(result.output, "orders").metrics
+        assert metric.name == "amount_2"
+        assert _raw_lightdash_data(metric)["name"] == "amount"
+        assert [
+            issue.element_name
+            for issue in result.issues
+            if issue.issue_type is ConverterIssueType.METRIC_NAME_COLLISION
+        ] == ["orders.amount"]
+
+    def test_qualified_names_that_still_collide_are_suffixed(self):
+        join = [{"join": "customers", "sql_on": "${orders.customer_id} = ${customers.id}"}]
+        schema_yml = {
+            "models": [
+                {
+                    "name": "orders",
+                    "meta": {
+                        "joins": join,
+                        "metrics": {"x_total": {"type": "sum", "sql": "${customers.spend}"}},
+                    },
+                    "columns": [{"name": "customer_id"}],
                 },
                 {
                     "name": "orders_x",
-                    "columns": [{"name": "amount", "meta": {"metrics": {"total": {"type": "sum"}}}}],
+                    "meta": {
+                        "joins": join,
+                        "metrics": {"total": {"type": "sum", "sql": "${customers.spend}"}},
+                    },
+                    "columns": [{"name": "customer_id"}],
                 },
+                {"name": "customers", "columns": [{"name": "id"}, {"name": "spend"}]},
             ]
         }
         result = LightdashToOssieConverter().convert(schema_yml, schema="marts")
@@ -717,11 +798,12 @@ class TestLightdashToOssie:
         }
         result = LightdashToOssieConverter().convert(schema_yml, schema="marts")
         assert _metric(result.output, "use_percentage").expression.dialects[0].expression == (
-            "SUM(budgets.budget_use) / NULLIF(SUM(budgets.budget_total), 0)"
+            "SUM(budget_use) / NULLIF(SUM(budget_total), 0)"
         )
-        # The literal is untouched; the column reference is qualified.
+        # The literal is untouched; the column reference is a bare field name,
+        # the dataset-scoped form.
         assert _metric(result.output, "mobile_share").expression.dialects[0].expression == (
-            "SUM(CASE WHEN budgets.device_type = 'device_type' THEN 1 END) / COUNT(*)"
+            "SUM(CASE WHEN device_type = 'device_type' THEN 1 END) / COUNT(*)"
         )
         # A column named like a function is not qualified when called.
         fields = {f.name: f.expression.dialects[0].expression for f in result.output.datasets[0].fields}
@@ -892,7 +974,7 @@ class TestLightdashToOssie:
         result = LightdashToOssieConverter().convert(schema_yml, schema="marts")
         # The values are stashed for Lightdash, and the loss for everyone else is reported.
         paid = _metric(result.output, "paid_amount")
-        assert paid.expression.dialects[0].expression == "SUM(orders.amount)"
+        assert paid.expression.dialects[0].expression == "SUM(amount)"
         assert _lightdash_data(paid) == {"filters": [{"status": "paid"}]}
         assert [
             issue.element_name
@@ -992,7 +1074,7 @@ class TestLightdashToOssie:
             "CASE WHEN orders.amount > 100 THEN 'big' ELSE 'small' END"
         )
         assert _metric(result.output, "aov").expression.dialects[0].expression == (
-            "(SUM(orders.amount)) / NULLIF((COUNT(DISTINCT orders.order_id)), 0)"
+            "(SUM(amount)) / NULLIF((COUNT(DISTINCT order_id)), 0)"
         )
         assert result.output.relationships[0].to == "customers"
         assert not any(i.issue_type is ConverterIssueType.SOURCE_UNQUALIFIED for i in result.issues)
