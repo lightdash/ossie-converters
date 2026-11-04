@@ -231,9 +231,8 @@ def ossie_sql_to_lightdash(
     ``dataset.column`` becomes ``${TABLE}.column``. A dataset in
     ``references`` (joined from ``dataset``) becomes
     ``${<join reference>.column}``, where the join reference is the joined
-    model's name or its alias. Text inside string literals and a dataset
-    name that is part of a longer path (``warehouse.orders.id``) are left as
-    they are.
+    model's name or its alias. A string literal, and a dataset name inside
+    a longer path (``warehouse.orders.id``), stay as they are.
     """
     # The dataset's own mapping is applied last, so a join reference can't
     # override it. In a self-join (`employees` joined as `manager`), the
@@ -252,8 +251,8 @@ def ossie_sql_to_lightdash(
 
 def unqualify_dataset(expression: str, dataset: str) -> str:
     """Rewrites ``dataset.column`` references to the bare ``column``, the form
-    a dataset-scoped metric uses. Text inside string literals and longer
-    paths (``warehouse.orders.id``) are left as they are."""
+    a dataset-scoped metric uses. String literals and longer paths
+    (``warehouse.orders.id``) stay as they are."""
     return _sub_outside_literals(
         _reference_pattern({dataset}), lambda match: match.group(2), expression
     )
@@ -361,7 +360,7 @@ def referenced_datasets(expression: str, dataset_names: set) -> set:
     """Gets the subset of ``dataset_names`` that ``expression`` references.
 
     A dataset named only inside a string literal, or as part of a longer
-    path (``warehouse.orders.id``), is not referenced.
+    path (``warehouse.orders.id``), does not count as referenced.
     """
     if not dataset_names:
         return set()

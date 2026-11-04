@@ -594,9 +594,10 @@ class OssieToLightdashConverter:
     ) -> None:
         """Converts one metric into a Lightdash metric on the model that holds it.
 
-        ``scope_dataset`` is set for a dataset-scoped metric. Its expression
-        names the dataset's fields unqualified (``SUM(ss_quantity)``), so the
-        fields are qualified first and the metric always goes on that model.
+        ``scope_dataset`` names the dataset of a dataset-scoped metric. Its
+        expression names the dataset's fields unqualified (``SUM(ss_quantity)``),
+        so the converter qualifies the fields first and always places the
+        metric on that model.
         A model-scoped metric names fields as ``dataset.field`` and goes on
         the model ``_resolve_target_dataset`` selects.
         """
@@ -679,8 +680,8 @@ class OssieToLightdashConverter:
 
         # The Lightdash name is the one from the extension, else the Ossie
         # name. A model-scoped name is Lightdash's `<model>_<metric>` field
-        # ID, so that prefix is removed. A dataset-scoped name is already
-        # scoped to its dataset and is used as it is.
+        # ID, so the converter removes that prefix. A dataset-scoped name is
+        # already scoped to its dataset and stays as it is.
         lightdash_name = extension_data.get("name")
         if not isinstance(lightdash_name, str) or not lightdash_name:
             prefix = f"{target_dataset}_"

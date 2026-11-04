@@ -237,7 +237,7 @@ class _ModelContext:
         self.column_types: Dict[str, str] = {}
         self.column_names: List[str] = []
         # Names taken in the dataset's namespace: its fields, then the
-        # dataset-scoped metrics as they are added.
+        # dataset-scoped metrics as the converter adds them.
         self.scoped_names: Set[str] = set()
         # Datatypes from --catalog, used when a column has no authored type.
         self.catalog_datatypes: Dict[str, "OssieDataType"] = {}
@@ -726,8 +726,8 @@ class LightdashToOssieConverter:
         else:
             # Lightdash scopes metric names per model, and Ossie model-scoped
             # metrics per semantic model. The Ossie name is Lightdash's field
-            # ID, `<model>_<metric>`. The bare name and the model are stored
-            # in the extension, so the export restores both exactly.
+            # ID, `<model>_<metric>`. The extension stores the bare name and
+            # the model, so the export restores both exactly.
             extension_data["name"] = metric_name
             extension_data["model"] = context.dataset_name
             qualified = f"{context.dataset_name}_{metric_name}"

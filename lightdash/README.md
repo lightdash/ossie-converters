@@ -233,20 +233,21 @@ and because most Lightdash projects have a `count` on several models, its
 Ossie name is Lightdash's field ID, `<model>_<metric>`, not only on
 collision: a metric's name must not change because a metric was added to a
 different model, and the field ID is what Lightdash users see in its API and
-URLs. The bare name and the model are stored in the extension and restored,
-so a Lightdash to Ossie to Lightdash round trip is exact in both scopes. An
+URLs. The extension stores the bare name and the model, and the export
+restores them, so a Lightdash to Ossie to Lightdash round trip is exact in
+both scopes. An
 Ossie document that Lightdash didn't write has its model-scoped metric names
 normalized once: `total_sales` on `store_sales` becomes
 `store_sales_total_sales` when it comes back through Lightdash; a
 dataset-scoped `total_quantity` on `store_sales` keeps its name.
 
-Lightdash itself keeps a model's dimension and metric names apart (a metric
-named like a dimension is skipped at compile time), and the core spec keeps a
-dataset's field and dataset-scoped metric names apart. On export, a metric
-whose Lightdash name is already a dimension or metric on the model is renamed
-with a `METRIC_NAME_COLLISION` issue rather than silently lost. A
-dataset-scoped metric that references another dataset, which the spec
-forbids, is exported through the model's joins as written and reported as
+Lightdash itself keeps a model's dimension and metric names apart
+(`lightdash compile` skips a metric named like a dimension), and the core spec
+keeps a dataset's field and dataset-scoped metric names apart. On export, the
+converter renames a metric whose Lightdash name is already a dimension or
+metric on the model, with a `METRIC_NAME_COLLISION` issue, rather than losing
+it. It exports a dataset-scoped metric that references another dataset, which
+the spec forbids, through the model's joins as written, and reports
 `METRIC_SCOPE_INVALID`.
 
 **What a dimension is.** Every dbt column is a Lightdash dimension unless it
@@ -265,9 +266,9 @@ consumers read the graph. Lightdash doesn't resolve `${other.column}`
 transitively, so a metric goes back on the model it came from (recorded as
 `model` in its extension) when that model joins every referenced dataset
 directly, which keeps a metric on `orders` that only reads `customers`
-columns aggregating over `orders` rows. A metric without a usable `model` is
-placed on the model that joins every referenced dataset directly. When no
-such model exists, the metric is dropped with an issue.
+columns aggregating over `orders` rows. A metric without a usable `model`
+goes on the model that joins every referenced dataset directly. When no such
+model exists, the converter drops the metric and reports an issue.
 
 **Query-time evaluation.** Lightdash evaluates project parameters, user
 attributes, and Liquid templating when a query runs. No other consumer can, so

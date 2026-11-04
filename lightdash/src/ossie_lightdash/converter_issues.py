@@ -75,11 +75,11 @@ class ConverterIssueType(Enum):
     # of its dataset. Export: a metric's Lightdash name is already a dimension
     # or metric on the same model (`revenue` and `orders_revenue` both strip
     # to `revenue`; Lightdash skips a metric named like a dimension). The
-    # later one is renamed, so it is not lost.
+    # converter renames the later one, so it is not lost.
     METRIC_NAME_COLLISION = "METRIC_NAME_COLLISION"
     # Export: a dataset-scoped metric (`datasets[].metrics`) references
-    # another dataset, which the core spec forbids. It is exported through
-    # the model's joins as written.
+    # another dataset, which the core spec forbids. The export writes it
+    # through the model's joins as written.
     METRIC_SCOPE_INVALID = "METRIC_SCOPE_INVALID"
     # Import: the metric's `filters` are kept for Lightdash only. The Ossie
     # expression is unfiltered, so other consumers compute a different number.
